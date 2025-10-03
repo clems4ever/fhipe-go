@@ -129,17 +129,13 @@ func AttachHints(ct *Ciphertext, pp *PublicParams, x, y []*big.Int) {
 }
 
 // Recover pairing target Z = e(g1,g2)^{<x,y>}
+// PairingAggregate performs product of pairings using a single multi-pairing call.
 func PairingAggregate(pp *PublicParams, ct *Ciphertext, key *Key) (bn254.GT, error) {
-	var acc bn254.GT
-	acc.SetOne()
-	for i := 0; i < ct.n; i++ {
-		pz, err := bn254.Pair([]bn254.G1Affine{ct.C[i]}, []bn254.G2Affine{key.K[i]})
-		if err != nil {
-			return acc, err
-		}
-		acc.Mul(&acc, &pz)
-	}
-	return acc, nil
+	g1s := make([]bn254.G1Affine, ct.n)
+	g2s := make([]bn254.G2Affine, ct.n)
+	copy(g1s, ct.C)
+	copy(g2s, key.K)
+	return bn254.Pair(g1s, g2s)
 }
 
 // Recover residues by solving tiny DLP: h_j = g2^{r_j}
@@ -229,24 +225,26 @@ func restrictedSearch(base bn254.GT, target bn254.GT, bound int64, x0 int64, M i
 
 func main() {
 	fmt.Println("=== Minimal IPE + Structured Hints Demo ===")
-	// Parameters
-	n := 64
+	// ------------------------------------------------------------------
+	// Single-vector illustrative demo (small dimension)
+	// ------------------------------------------------------------------
+	demoN := 64
 	bound := int64(1_000_000) // synthetic upper bound for <x,y>
-	fmt.Printf("Dimension n=%d, synthetic DLP bound=%d\n", n, bound)
+	fmt.Printf("[DEMO] Dimension n=%d, synthetic DLP bound=%d\n", demoN, bound)
 
-	pp, _ := Setup(n)
+	pp, _ := Setup(demoN)
 	fmt.Println("✓ Setup complete")
 
 	// Sample small vectors (to keep true t moderately sized but unpredictable)
-	x := make([]*big.Int, n)
-	y := make([]*big.Int, n)
-	for i := 0; i < n; i++ {
+	x := make([]*big.Int, demoN)
+	y := make([]*big.Int, demoN)
+	for i := 0; i < demoN; i++ {
 		x[i] = big.NewInt(int64(i%11 + 1))
 		y[i] = big.NewInt(int64((7*i)%13 + 1))
 	}
 	// Compute true t
 	trueT := big.NewInt(0)
-	for i := 0; i < n; i++ {
+	for i := 0; i < demoN; i++ {
 		trueT.Add(trueT, new(big.Int).Mul(x[i], y[i]))
 	}
 	fmt.Printf("True inner product t=%s\n", trueT.String())
@@ -302,4 +300,86 @@ func main() {
 	fmt.Printf("Speedup factor ≈ %.2f× (naive/restricted)\n", float64(naiveDur)/float64(restrDur))
 	fmt.Printf("Ideal pruning factor (M) = %d\n", M)
 	fmt.Println("Note: For a fair large-scale test, choose bound >> true t and ensure true t < bound.")
+
+	// ------------------------------------------------------------------
+	// Throughput Benchmark: 100 vectors of dimension 384
+	// Measures:
+	//  - Encryption (C_i + hints)
+	//  - Decryption + recovery (pairings + residues + restricted search)
+	// ------------------------------------------------------------------
+	fmt.Println("\n=== THROUGHPUT BENCHMARK (100 vectors, n=384) ===")
+	benchN := 384
+	numVectors := 100
+	benchBound := int64(1_000_000) // keep consistent; real scenarios may use much larger
+	ppBench, _ := Setup(benchN)
+	// Fixed y across all ciphertexts (common in many IPE usage patterns)
+	yBench := make([]*big.Int, benchN)
+	for i := 0; i < benchN; i++ {
+		yBench[i] = big.NewInt(int64((5*i)%17 + 1))
+	}
+	keyBench := KeyGen(ppBench, yBench)
+
+	// Pre-generate x vectors & true inner products (for later correctness check)
+	xVectors := make([][]*big.Int, numVectors)
+	trueInner := make([]*big.Int, numVectors)
+	for v := 0; v < numVectors; v++ {
+		vec := make([]*big.Int, benchN)
+		acc := big.NewInt(0)
+		for i := 0; i < benchN; i++ {
+			val := int64((v+i*7)%23 + 1) // pseudo-structured variation
+			vec[i] = big.NewInt(val)
+			acc.Add(acc, new(big.Int).Mul(vec[i], yBench[i]))
+		}
+		xVectors[v] = vec
+		trueInner[v] = acc
+	}
+
+	// Encryption benchmark
+	ctBench := make([]*Ciphertext, numVectors)
+	startEnc := time.Now()
+	for v := 0; v < numVectors; v++ {
+		ctv := Encrypt(ppBench, xVectors[v])
+		AttachHints(ctv, ppBench, xVectors[v], yBench)
+		ctBench[v] = ctv
+	}
+	encDur := time.Since(startEnc)
+
+	// Base pairing constant
+	basePairBench, err := bn254.Pair([]bn254.G1Affine{ppBench.g1}, []bn254.G2Affine{ppBench.g2})
+	if err != nil {
+		panic(err)
+	}
+
+	// Decryption + recovery benchmark
+	startDec := time.Now()
+	recoverFailures := 0
+	for v := 0; v < numVectors; v++ {
+		Zb, err := PairingAggregate(ppBench, ctBench[v], keyBench)
+		if err != nil {
+			panic(err)
+		}
+		res := recoverResidues(ppBench, ctBench[v].hints)
+		crtRepV := crt(res, hintPrimes)
+		Mv := int64(1)
+		for _, p := range hintPrimes {
+			Mv *= p
+		}
+		x0v := crtRepV.Int64()
+		found, ok := restrictedSearch(basePairBench, Zb, benchBound, x0v, Mv)
+		if !ok || big.NewInt(found).Cmp(trueInner[v]) != 0 {
+			recoverFailures++
+		}
+	}
+	decDur := time.Since(startDec)
+
+	encThroughput := float64(numVectors) / encDur.Seconds()
+	decThroughput := float64(numVectors) / decDur.Seconds()
+
+	fmt.Println("\n--- Benchmark Summary ---")
+	fmt.Printf("Dimension: %d, Vectors: %d\n", benchN, numVectors)
+	fmt.Printf("Encryption total: %v | avg: %v | throughput: %.2f ops/sec\n", encDur, encDur/time.Duration(numVectors), encThroughput)
+	fmt.Printf("Decryption+Recovery total: %v | avg: %v | throughput: %.2f ops/sec\n", decDur, decDur/time.Duration(numVectors), decThroughput)
+	fmt.Printf("Failures in recovery: %d\n", recoverFailures)
+	fmt.Printf("Hint primes: %v (product=%d)\n", hintPrimes, M)
+	fmt.Println("--------------------------")
 }
