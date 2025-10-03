@@ -5,178 +5,148 @@ import (
 	"log"
 	"os"
 	"time"
-	
+
 	bls12381 "github.com/consensys/gnark-crypto/ecc/bls12-381"
 )
 
 func main() {
-	// Example: Using FHIPE to compute inner products with PRECOMPUTED TABLE
-	// We'll create 10 vectors and compute the inner product of vector 0 with each of the others
+	// Run parallel scaling benchmark
+	BenchmarkParallelScaling()
+	fmt.Println("\n============================================================\n")
 
-	n := 5    // dimension of vectors
-	S := 1000 // bound for inner product range [-S, S]
+	// Original throughput benchmark
+	runThroughputBenchmark()
+}
 
-	fmt.Println("=== FHIPE Inner Product Example with Precomputed Table ===")
+func runThroughputBenchmark() {
+	n := 384   // dimension of vectors
+	S := 10000 // bound for inner product range [-S, S]
+
+	fmt.Println("=== FHIPE Throughput Benchmark ===")
 	fmt.Printf("Vector dimension: %d\n", n)
 	fmt.Printf("Inner product bound: [-%d, %d]\n\n", S, S)
 
-	// Step 1: Setup the scheme
-	fmt.Println("Step 1: Running Setup...")
+	fmt.Println("Setup...")
+	start := time.Now()
 	pp, msk, err := Setup(n, S)
 	if err != nil {
 		log.Fatalf("Setup failed: %v", err)
 	}
-	fmt.Println("Setup complete!")
-	fmt.Println()
+	fmt.Printf("Setup: %v\n\n", time.Since(start))
 
-	// Step 2: Create 10 vectors
-	vectors := make([][]int, 10)
-
-	// Vector 0: [1, 2, 3, 4, 5]
-	vectors[0] = []int{1, 2, 3, 4, 5}
-
-	// Vector 1: [5, 4, 3, 2, 1]
-	vectors[1] = []int{5, 4, 3, 2, 1}
-
-	// Vector 2: [1, 1, 1, 1, 1]
-	vectors[2] = []int{1, 1, 1, 1, 1}
-
-	// Vector 3: [10, 0, 0, 0, 0]
-	vectors[3] = []int{10, 0, 0, 0, 0}
-
-	// Vector 4: [0, 10, 0, 0, 0]
-	vectors[4] = []int{0, 10, 0, 0, 0}
-
-	// Vector 5: [0, 0, 10, 0, 0]
-	vectors[5] = []int{0, 0, 10, 0, 0}
-
-	// Vector 6: [1, -1, 1, -1, 1]
-	vectors[6] = []int{1, -1, 1, -1, 1}
-
-	// Vector 7: [2, 2, 2, 2, 2]
-	vectors[7] = []int{2, 2, 2, 2, 2}
-
-	// Vector 8: [-1, -2, -3, -4, -5]
-	vectors[8] = []int{-1, -2, -3, -4, -5}
-
-	// Vector 9: [0, 0, 0, 0, 1]
-	vectors[9] = []int{0, 0, 0, 0, 1}
-
-	fmt.Println("Step 2: Created 10 vectors")
-	for i, v := range vectors {
-		fmt.Printf("  Vector %d: %v\n", i, v)
+	// Generate random vectors
+	numVectors := 1000
+	vectors := make([][]int, numVectors)
+	for i := 0; i < numVectors; i++ {
+		vectors[i] = make([]int, n)
+		for j := 0; j < n; j++ {
+			vectors[i][j] = (i*j+j)%20 - 10 // deterministic pseudo-random
+		}
 	}
-	fmt.Println()
 
-	// Step 3: Generate secret key for vector 0
-	fmt.Println("Step 3: Generating secret key for vector 0...")
+	fmt.Println("KeyGen...")
+	start = time.Now()
 	x := IntsToFrElements(vectors[0])
 	sk, err := KeyGen(msk, x)
 	if err != nil {
 		log.Fatalf("KeyGen failed: %v", err)
 	}
-	fmt.Println("Secret key generated!")
-	fmt.Println()
+	fmt.Printf("KeyGen: %v\n\n", time.Since(start))
 
-	// Step 4: Compute gt_base = e(K1, g2) for table precomputation
-	fmt.Println("Step 4: Computing gt_base = e(K1, g2) for table precomputation...")
+	// Compute gt_base
 	gt_base, err := bls12381.Pair([]bls12381.G1Affine{sk.K1}, []bls12381.G2Affine{pp.G2Gen})
 	if err != nil {
 		log.Fatalf("Failed to compute gt_base: %v", err)
 	}
-	fmt.Println("gt_base computed!")
-	fmt.Println()
 
-	// Step 5: Load or create precomputed table
+	// Load or create table
 	tableFile := "precomputed_table.gob"
 	var table *PrecomputedTable
 
-	fmt.Println("Step 5: Checking for precomputed table...")
 	if _, err := os.Stat(tableFile); err == nil {
-		fmt.Printf("  ✓ Found existing table: %s\n", tableFile)
-		fmt.Println("  Loading from disk...")
-		start := time.Now()
+		start = time.Now()
 		table, err = LoadTableFromDisk(tableFile)
 		if err != nil {
 			log.Fatalf("Failed to load table: %v", err)
 		}
-		fmt.Printf("  ✓ Loaded in %v (%d entries)\n", time.Since(start), len(table.Table))
-		
+		fmt.Printf("Table loaded from disk: %v (%d entries)\n", time.Since(start), len(table.Table))
+
 		if table.Bound != S {
-			fmt.Printf("  ⚠ Table bound mismatch (%d vs %d), regenerating...\n", table.Bound, S)
+			fmt.Printf("Table bound mismatch, regenerating...\n")
 			table = nil
 		}
 	}
 
 	if table == nil {
-		fmt.Println("  ✗ No valid table found")
-		fmt.Printf("  Precomputing table for bound %d...\n", S)
-		start := time.Now()
+		fmt.Printf("Precomputing table (bound=%d)...\n", S)
+		start = time.Now()
 		table = PrecomputeTable(gt_base, S)
-		precomputeTime := time.Since(start)
-		fmt.Printf("  ✓ Precomputed %d entries in %v\n", len(table.Table), precomputeTime)
-		
-		fmt.Printf("  Saving to %s...\n", tableFile)
+		fmt.Printf("Precomputation: %v (%d entries)\n", time.Since(start), len(table.Table))
+
 		start = time.Now()
 		if err := SaveTableToDisk(table, tableFile); err != nil {
-			log.Printf("  ⚠ Warning: Failed to save: %v", err)
+			log.Printf("Warning: Failed to save: %v", err)
 		} else {
-			fmt.Printf("  ✓ Saved in %v\n", time.Since(start))
+			fmt.Printf("Saved to disk: %v\n", time.Since(start))
 		}
 	}
 	fmt.Println()
 
-	// Step 6: Compute inner products using PRECOMPUTED TABLE
-	fmt.Println("Step 6: Computing inner products using PRECOMPUTED TABLE...")
-	fmt.Println()
+	// Benchmark throughput
+	fmt.Printf("Running throughput benchmark with %d encryptions...\n\n", numVectors)
 
-	totalRecoveryTime := time.Duration(0)
-	
-	for i := 0; i < 10; i++ {
-		// Convert vector to field elements
+	// Pre-encrypt all vectors
+	fmt.Println("Pre-encrypting vectors...")
+	ciphertexts := make([]Ciphertext, numVectors)
+	encryptStart := time.Now()
+	for i := 0; i < numVectors; i++ {
 		y := IntsToFrElements(vectors[i])
-
-		// Encrypt the vector
 		ct, err := Encrypt(msk, y)
 		if err != nil {
-			log.Fatalf("Encrypt failed for vector %d: %v", i, err)
+			log.Fatalf("Encrypt failed: %v", err)
 		}
-
-		// Decrypt to get D1 and D2
-		D1, D2, err := Decrypt(pp, sk, ct)
-		if err != nil {
-			log.Fatalf("Decrypt failed for vector %d: %v", i, err)
-		}
-
-		// Recover the inner product using PRECOMPUTED TABLE (O(1) lookup!)
-		start := time.Now()
-		innerProduct, found := RecoverInnerProductWithTable(D1, D2, table)
-		recoveryTime := time.Since(start)
-		totalRecoveryTime += recoveryTime
-		
-		if !found {
-			fmt.Printf("  Vector 0 · Vector %d: NOT FOUND (outside bounds)\n", i)
-			continue
-		}
-
-		// Compute expected inner product for verification
-		expected := 0
-		for j := 0; j < n; j++ {
-			expected += vectors[0][j] * vectors[i][j]
-		}
-
-		// Display results
-		status := "✓"
-		if innerProduct != expected {
-			status = "✗"
-		}
-		fmt.Printf("  Vector 0 · Vector %d = %3d %s (table lookup: %v)\n", i, innerProduct, status, recoveryTime)
+		ciphertexts[i] = ct
 	}
+	encryptTime := time.Since(encryptStart)
+	fmt.Printf("Encryption: %v total, %v per op\n", encryptTime, encryptTime/time.Duration(numVectors))
 
-	fmt.Printf("\nTotal recovery time (10 queries): %v\n", totalRecoveryTime)
-	fmt.Printf("Average per query: %v\n", totalRecoveryTime/10)
-	
-	fmt.Println("\n=== Example Complete ===")
-	fmt.Printf("Precomputed table saved to: %s\n", tableFile)
-	fmt.Println("Run again to see instant table loading from disk!")
+	// Decrypt and recover
+	fmt.Println("\nDecrypting and recovering (PARALLEL)...")
+	decryptStart := time.Now()
+	var totalRecoveryTime time.Duration
+	var totalDecryptTime time.Duration
+	successful := 0
+
+	for i := 0; i < numVectors; i++ {
+		dStart := time.Now()
+		D1, D2, err := DecryptParallel(pp, sk, ciphertexts[i])
+		totalDecryptTime += time.Since(dStart)
+		if err != nil {
+			log.Fatalf("Decrypt failed: %v", err)
+		}
+
+		recoveryStart := time.Now()
+		_, found := RecoverInnerProductWithTable(D1, D2, table)
+		totalRecoveryTime += time.Since(recoveryStart)
+
+		if found {
+			successful++
+		}
+	}
+	totalTime := time.Since(decryptStart)
+
+	fmt.Printf("Total time: %v, %v per op\n", totalTime, totalTime/time.Duration(numVectors))
+	fmt.Printf("Decryption only: %v total, %v per op\n", totalDecryptTime, totalDecryptTime/time.Duration(numVectors))
+	fmt.Printf("Recovery only: %v total, %v per op\n", totalRecoveryTime, totalRecoveryTime/time.Duration(numVectors))
+	fmt.Printf("Successful recoveries: %d/%d\n\n", successful, numVectors)
+
+	// Throughput calculation
+	throughput := float64(numVectors) / totalTime.Seconds()
+	decryptThroughput := float64(numVectors) / totalDecryptTime.Seconds()
+	recoveryThroughput := float64(numVectors) / totalRecoveryTime.Seconds()
+
+	fmt.Println("=== THROUGHPUT RESULTS ===")
+	fmt.Printf("Full operation (decrypt + recover): %.2f ops/sec\n", throughput)
+	fmt.Printf("Decryption only: %.2f ops/sec\n", decryptThroughput)
+	fmt.Printf("Recovery only: %.2f ops/sec\n", recoveryThroughput)
 }

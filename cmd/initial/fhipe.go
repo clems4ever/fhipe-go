@@ -275,6 +275,72 @@ func Decrypt(pp Params, sk SecretKey, ct Ciphertext) (D1 bls12381.GT, D2 bls1238
 	return D1, D2, nil
 }
 
+// DecryptParallel is a parallelized version of Decrypt that splits the pairing computation
+// across multiple goroutines for better performance with large dimensions.
+func DecryptParallel(pp Params, sk SecretKey, ct Ciphertext) (D1 bls12381.GT, D2 bls12381.GT, err error) {
+	n := len(sk.K2)
+	if n != len(ct.C2) {
+		return bls12381.GT{}, bls12381.GT{}, ErrDimensionMismatch
+	}
+
+	// D1 = e(K1, C1)
+	D1, err = bls12381.Pair([]bls12381.G1Affine{sk.K1}, []bls12381.G2Affine{ct.C1})
+	if err != nil {
+		return bls12381.GT{}, bls12381.GT{}, err
+	}
+
+	// Parallelize D2 computation by splitting pairings across workers
+	workers := runtime.GOMAXPROCS(0)
+	if workers > n {
+		workers = n
+	}
+	if workers < 2 || n < 64 {
+		// For small n, use sequential (less overhead)
+		D2, err = bls12381.Pair(sk.K2, ct.C2)
+		return D1, D2, err
+	}
+
+	chunk := (n + workers - 1) / workers
+	results := make([]bls12381.GT, workers)
+	var wg sync.WaitGroup
+	var computeErr error
+	var errOnce sync.Once
+
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if end > n {
+			end = n
+		}
+
+		go func(workerID, s, e int) {
+			defer wg.Done()
+
+			// Compute partial product for this chunk
+			partial, err := bls12381.Pair(sk.K2[s:e], ct.C2[s:e])
+			if err != nil {
+				errOnce.Do(func() { computeErr = err })
+				return
+			}
+			results[workerID] = partial
+		}(w, start, end)
+	}
+	wg.Wait()
+
+	if computeErr != nil {
+		return bls12381.GT{}, bls12381.GT{}, computeErr
+	}
+
+	// Combine results
+	D2 = results[0]
+	for i := 1; i < workers; i++ {
+		D2.Mul(&D2, &results[i])
+	}
+
+	return D1, D2, nil
+}
+
 // RecoverInnerProduct searches for z ∈ S such that (D1)^z = D2.
 // S is defined as the set {z ∈ Z : -bound ≤ z ≤ bound} (polynomial-sized).
 // Returns (z, true) if found, (0, false) otherwise (⊥).
@@ -440,17 +506,17 @@ func gtKey(g *bls12381.GT) string {
 func PrecomputeTable(gt_base bls12381.GT, bound int) *PrecomputedTable {
 	N := 2*bound + 1
 	table := make(map[string]int, N)
-	
+
 	// Use parallel computation for large bounds
 	if bound < 1000 {
 		// Sequential for small bounds
 		var cur bls12381.GT
 		var zBig big.Int
-		
+
 		// Compute gt_base^{-bound} as starting point
 		zBig.SetInt64(int64(-bound))
 		cur.Exp(gt_base, &zBig)
-		
+
 		// Now iterate from -bound to +bound
 		for z := -bound; z <= bound; z++ {
 			table[gtKey(&cur)] = z
@@ -464,7 +530,7 @@ func PrecomputeTable(gt_base bls12381.GT, bound int) *PrecomputedTable {
 		chunk := (N + workers - 1) / workers
 		var wg sync.WaitGroup
 		var mu sync.Mutex
-		
+
 		wg.Add(workers)
 		for w := 0; w < workers; w++ {
 			start := w * chunk
@@ -472,21 +538,21 @@ func PrecomputeTable(gt_base bls12381.GT, bound int) *PrecomputedTable {
 			if end > N {
 				end = N
 			}
-			
+
 			go func(s, e int) {
 				defer wg.Done()
 				localTable := make(map[string]int, e-s)
-				
+
 				for idx := s; idx < e; idx++ {
 					z := idx - bound
 					var zBig big.Int
 					zBig.SetInt64(int64(z))
-					
+
 					var val bls12381.GT
 					val.Exp(gt_base, &zBig)
 					localTable[gtKey(&val)] = z
 				}
-				
+
 				// Merge into global table
 				mu.Lock()
 				for k, v := range localTable {
@@ -497,7 +563,7 @@ func PrecomputeTable(gt_base bls12381.GT, bound int) *PrecomputedTable {
 		}
 		wg.Wait()
 	}
-	
+
 	return &PrecomputedTable{
 		Table: table,
 		Bound: bound,
@@ -518,25 +584,25 @@ func SaveTableToDisk(table *PrecomputedTable, filename string) error {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
 	defer file.Close()
-	
+
 	// Convert map to slice for serialization
 	serTable := SerializableTable{
 		Entries: make([]TableEntry, 0, len(table.Table)),
 		Bound:   table.Bound,
 	}
-	
+
 	for key, val := range table.Table {
 		serTable.Entries = append(serTable.Entries, TableEntry{
 			Key:   key,
 			Value: val,
 		})
 	}
-	
+
 	encoder := gob.NewEncoder(file)
 	if err := encoder.Encode(serTable); err != nil {
 		return fmt.Errorf("failed to encode table: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -547,23 +613,23 @@ func LoadTableFromDisk(filename string) (*PrecomputedTable, error) {
 		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
-	
+
 	var serTable SerializableTable
 	decoder := gob.NewDecoder(file)
 	if err := decoder.Decode(&serTable); err != nil {
 		return nil, fmt.Errorf("failed to decode table: %w", err)
 	}
-	
+
 	// Convert slice back to map
 	table := &PrecomputedTable{
 		Table: make(map[string]int, len(serTable.Entries)),
 		Bound: serTable.Bound,
 	}
-	
+
 	for _, entry := range serTable.Entries {
 		table.Table[entry.Key] = entry.Value
 	}
-	
+
 	return table, nil
 }
 
@@ -602,37 +668,9 @@ func RecoverInnerProductWithTable(D1, D2 bls12381.GT, table *PrecomputedTable) (
 	if table == nil || table.Bound == 0 {
 		return 0, false
 	}
-	
-	// Simple sequential search approach:
-	// Start from D2 and repeatedly divide by D1 (multiply by D1^{-1})
-	// Count how many divisions until we get identity
-	var D1inv bls12381.GT
-	D1inv.Inverse(&D1)
-	
-	var cur bls12381.GT
-	cur = D2
-	
-	var identity bls12381.GT
-	identity.SetOne()
-	
-	// Try positive z values
-	for z := 0; z <= table.Bound; z++ {
-		if cur.Equal(&identity) {
-			return z, true
-		}
-		cur.Mul(&cur, &D1inv) // cur = D2 / D1^z
-	}
-	
-	// Try negative z values
-	cur = D2
-	for z := -1; z >= -table.Bound; z-- {
-		cur.Mul(&cur, &D1) // cur = D2 * D1^{|z|}
-		if cur.Equal(&identity) {
-			return z, true
-		}
-	}
-	
-	return 0, false
+
+	// Use BSGS instead of sequential search for better performance
+	return RecoverInnerProduct(D1, D2, table.Bound)
 }
 
 // IntsToFrElements converts a slice of integers to a slice of fr.Element.

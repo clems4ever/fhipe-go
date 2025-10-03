@@ -57,7 +57,7 @@ OPTIMIZED WORKFLOW WITH PRECOMPUTED TABLE:
    y := IntsToFrElements([]int{5, 4, 3, 2, 1})
    ct, err := Encrypt(msk, y)
    D1, D2, err := Decrypt(pp, sk, ct)
-   
+
    // Fast O(1) lookup instead of O(√N) BSGS
    innerProduct, found := RecoverInnerProductWithTable(D1, D2, table)
 
@@ -110,15 +110,15 @@ func example() {
     // Setup
     n, S := 5, 1000
     pp, msk, _ := Setup(n, S)
-    
+
     // Secret key for x = [1, 2, 3, 4, 5]
     x := IntsToFrElements([]int{1, 2, 3, 4, 5})
     sk, _ := KeyGen(msk, x)
-    
+
     // Try to load existing table
     tablePath := "table.gob"
     var table *PrecomputedTable
-    
+
     if fileExists(tablePath) {
         table, _ = LoadTableFromDisk(tablePath)
     } else {
@@ -126,12 +126,12 @@ func example() {
         y0 := IntsToFrElements([]int{1, 0, 0, 0, 0})
         ct0, _ := Encrypt(msk, y0)
         D1, _, _ := Decrypt(pp, sk, ct0)
-        
+
         // Precompute and save
         table = PrecomputeTable(D1, S)
         SaveTableToDisk(table, tablePath)
     }
-    
+
     // Now compute many inner products efficiently
     vectors := [][]int{
         {5, 4, 3, 2, 1},
@@ -139,12 +139,12 @@ func example() {
         {10, 0, 0, 0, 0},
         // ... more vectors
     }
-    
+
     for _, vec := range vectors {
         y := IntsToFrElements(vec)
         ct, _ := Encrypt(msk, y)
         D1, D2, _ := Decrypt(pp, sk, ct)
-        
+
         // O(1) recovery with table
         result, _ := RecoverInnerProductWithTable(D1, D2, table)
         fmt.Printf("Inner product: %d\n", result)
