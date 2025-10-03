@@ -12,7 +12,9 @@ import (
 func main() {
 	// Run parallel scaling benchmark
 	BenchmarkParallelScaling()
-	fmt.Println("\n============================================================\n")
+	fmt.Println()
+	fmt.Println("============================================================")
+	fmt.Println()
 
 	// Original throughput benchmark
 	runThroughputBenchmark()
@@ -20,7 +22,7 @@ func main() {
 
 func runThroughputBenchmark() {
 	n := 384   // dimension of vectors
-	S := 10000 // bound for inner product range [-S, S]
+	S := 40000 // bound for inner product range [-S, S] (384 * 10 * 10 = 38400 max)
 
 	fmt.Println("=== FHIPE Throughput Benchmark ===")
 	fmt.Printf("Vector dimension: %d\n", n)
@@ -35,7 +37,7 @@ func runThroughputBenchmark() {
 	fmt.Printf("Setup: %v\n\n", time.Since(start))
 
 	// Generate random vectors
-	numVectors := 1000
+	numVectors := 100
 	vectors := make([][]int, numVectors)
 	for i := 0; i < numVectors; i++ {
 		vectors[i] = make([]int, n)
@@ -92,10 +94,9 @@ func runThroughputBenchmark() {
 	}
 	fmt.Println()
 
-	// Benchmark throughput
-	fmt.Printf("Running throughput benchmark with %d encryptions...\n\n", numVectors)
-
-	// Pre-encrypt all vectors
+	// Benchmark throughput with 100 vectors
+	numVectors = 100
+	fmt.Printf("Running throughput benchmark with %d encryptions...\n\n", numVectors) // Pre-encrypt all vectors
 	fmt.Println("Pre-encrypting vectors...")
 	ciphertexts := make([]Ciphertext, numVectors)
 	encryptStart := time.Now()
@@ -110,35 +111,64 @@ func runThroughputBenchmark() {
 	encryptTime := time.Since(encryptStart)
 	fmt.Printf("Encryption: %v total, %v per op\n", encryptTime, encryptTime/time.Duration(numVectors))
 
-	// Decrypt and recover
-	fmt.Println("\nDecrypting and recovering (PARALLEL)...")
+	// Batch decrypt and recover
+	fmt.Println("\nDecrypting and recovering (BATCH PARALLEL)...")
 	decryptStart := time.Now()
-	var totalRecoveryTime time.Duration
-	var totalDecryptTime time.Duration
+
+	D1s, D2s, err := BatchDecryptParallel(pp, sk, ciphertexts)
+	if err != nil {
+		log.Fatalf("Batch decrypt failed: %v", err)
+	}
+	totalDecryptTime := time.Since(decryptStart)
+
+	recoveryStart := time.Now()
 	successful := 0
+	failed := 0
+	outOfBounds := 0
 
 	for i := 0; i < numVectors; i++ {
-		dStart := time.Now()
-		D1, D2, err := DecryptParallel(pp, sk, ciphertexts[i])
-		totalDecryptTime += time.Since(dStart)
-		if err != nil {
-			log.Fatalf("Decrypt failed: %v", err)
-		}
-
-		recoveryStart := time.Now()
-		_, found := RecoverInnerProductWithTable(D1, D2, table)
-		totalRecoveryTime += time.Since(recoveryStart)
-
+		result, found := RecoverInnerProductWithTable(D1s[i], D2s[i], table)
 		if found {
 			successful++
+
+			// Verify correctness on first few
+			if i < 10 {
+				expected := 0
+				for j := 0; j < n; j++ {
+					expected += vectors[0][j] * vectors[i][j]
+				}
+				if result != expected {
+					fmt.Printf("MISMATCH at %d: got %d, expected %d\n", i, result, expected)
+					failed++
+				}
+			}
+		} else {
+			// Check if it's actually out of bounds
+			expected := 0
+			for j := 0; j < n; j++ {
+				expected += vectors[0][j] * vectors[i][j]
+			}
+			if expected < -S || expected > S {
+				outOfBounds++
+				if outOfBounds <= 5 {
+					fmt.Printf("Out of bounds at %d: inner product = %d (bound = [-%d, %d])\n", i, expected, S, S)
+				}
+			} else {
+				fmt.Printf("RECOVERY FAILED at %d: inner product = %d (should be in bounds!)\n", i, expected)
+				failed++
+			}
 		}
 	}
+	totalRecoveryTime := time.Since(recoveryStart)
+
 	totalTime := time.Since(decryptStart)
 
-	fmt.Printf("Total time: %v, %v per op\n", totalTime, totalTime/time.Duration(numVectors))
+	fmt.Printf("\nTotal time: %v, %v per op\n", totalTime, totalTime/time.Duration(numVectors))
 	fmt.Printf("Decryption only: %v total, %v per op\n", totalDecryptTime, totalDecryptTime/time.Duration(numVectors))
 	fmt.Printf("Recovery only: %v total, %v per op\n", totalRecoveryTime, totalRecoveryTime/time.Duration(numVectors))
-	fmt.Printf("Successful recoveries: %d/%d\n\n", successful, numVectors)
+	fmt.Printf("Successful recoveries: %d/%d\n", successful, numVectors)
+	fmt.Printf("Out of bounds: %d\n", outOfBounds)
+	fmt.Printf("Failed (in bounds): %d\n\n", failed)
 
 	// Throughput calculation
 	throughput := float64(numVectors) / totalTime.Seconds()

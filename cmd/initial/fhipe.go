@@ -275,6 +275,59 @@ func Decrypt(pp Params, sk SecretKey, ct Ciphertext) (D1 bls12381.GT, D2 bls1238
 	return D1, D2, nil
 }
 
+// BatchDecryptParallel decrypts multiple ciphertexts in parallel, processing each
+// ciphertext's pairings concurrently. This amortizes goroutine overhead.
+func BatchDecryptParallel(pp Params, sk SecretKey, cts []Ciphertext) ([]bls12381.GT, []bls12381.GT, error) {
+	numCts := len(cts)
+	if numCts == 0 {
+		return nil, nil, nil
+	}
+
+	D1s := make([]bls12381.GT, numCts)
+	D2s := make([]bls12381.GT, numCts)
+
+	// Process all ciphertexts in parallel
+	workers := runtime.GOMAXPROCS(0)
+	if workers > numCts {
+		workers = numCts
+	}
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+
+	chunk := (numCts + workers - 1) / workers
+	wg.Add(workers)
+
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if end > numCts {
+			end = numCts
+		}
+
+		go func(s, e int) {
+			defer wg.Done()
+			for i := s; i < e; i++ {
+				D1, D2, err := DecryptParallel(pp, sk, cts[i])
+				if err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				D1s[i] = D1
+				D2s[i] = D2
+			}
+		}(start, end)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, nil, firstErr
+	}
+
+	return D1s, D2s, nil
+}
+
 // DecryptParallel is a parallelized version of Decrypt that splits the pairing computation
 // across multiple goroutines for better performance with large dimensions.
 func DecryptParallel(pp Params, sk SecretKey, ct Ciphertext) (D1 bls12381.GT, D2 bls12381.GT, err error) {
@@ -290,7 +343,11 @@ func DecryptParallel(pp Params, sk SecretKey, ct Ciphertext) (D1 bls12381.GT, D2
 	}
 
 	// Parallelize D2 computation by splitting pairings across workers
+	// Optimal is 4-8 workers based on benchmarks
 	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8 // Cap at 8 for best efficiency
+	}
 	if workers > n {
 		workers = n
 	}
