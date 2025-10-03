@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"runtime"
+	"sync"
 
 	bls12381 "github.com/consensys/gnark-crypto/ecc/bls12-381"
 	"github.com/consensys/gnark-crypto/ecc/bls12-381/fr"
@@ -23,6 +25,7 @@ type MSK struct {
 	PP    Params
 	B     [][]fr.Element // n x n over Z_q
 	Bstar [][]fr.Element // det(B) * (B^{-1})^T mod q
+	DetB  fr.Element     // cached determinant of B
 }
 
 // SecretKey holds sk = (K1, K2) where
@@ -73,7 +76,7 @@ func Setup(n int, S int) (Params, MSK, error) {
 		}
 	}
 
-	msk := MSK{PP: pp, B: B, Bstar: Bstar}
+	msk := MSK{PP: pp, B: B, Bstar: Bstar, DetB: detB}
 	return pp, msk, nil
 }
 
@@ -88,44 +91,69 @@ func KeyGen(msk MSK, x []fr.Element) (SecretKey, error) {
 		return SecretKey{}, ErrDimensionMismatch
 	}
 
-	// 1) Sample α ← Z_q
+	// Sample α ← Z_q
 	var alpha fr.Element
 	if _, err := alpha.SetRandom(); err != nil {
 		return SecretKey{}, err
 	}
 
-	// 2) det(B) (cache this in MSK at setup in real code)
-	detB, err := determinant(msk.B)
-	if err != nil {
-		return SecretKey{}, err
-	}
-
-	// 3) K1 = g1^(α · det(B))
+	// K1 = g1^(α · det(B)) using cached determinant
 	var exp1 fr.Element
-	exp1.Mul(&alpha, &detB)
+	exp1.Mul(&alpha, &msk.DetB)
 	K1 := g1Exp(msk.PP.G1Gen, exp1)
 
-	// 4) y = x · B ∈ Z_q^n  (row-vector times matrix)
 	y := make([]fr.Element, n)
-	for j := 0; j < n; j++ {
-		var acc fr.Element
-		acc.SetZero()
-		for i := 0; i < n; i++ {
-			var tmp fr.Element
-			tmp.Mul(&x[i], &msk.B[i][j])
-			acc.Add(&acc, &tmp)
-		}
-		y[j] = acc
-	}
-
-	// 5) K2[j] = g1^(α · y[j])  for j=0..n-1
 	K2 := make([]bls12381.G1Affine, n)
-	for j := 0; j < n; j++ {
-		var e fr.Element
-		e.Mul(&alpha, &y[j])
-		K2[j] = g1Exp(msk.PP.G1Gen, e)
+
+	// Parallel threshold (avoid goroutine overhead for small n)
+	if n < 32 {
+		for j := 0; j < n; j++ {
+			var acc fr.Element
+			acc.SetZero()
+			for i := 0; i < n; i++ {
+				var tmp fr.Element
+				tmp.Mul(&x[i], &msk.B[i][j])
+				acc.Add(&acc, &tmp)
+			}
+			y[j] = acc
+			var e fr.Element
+			e.Mul(&alpha, &acc)
+			K2[j] = g1Exp(msk.PP.G1Gen, e)
+		}
+		return SecretKey{K1: K1, K2: K2}, nil
 	}
 
+	workers := runtime.GOMAXPROCS(0)
+	if workers > n {
+		workers = n
+	}
+	chunk := (n + workers - 1) / workers
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if end > n {
+			end = n
+		}
+		go func(s, e int) {
+			defer wg.Done()
+			for j := s; j < e; j++ {
+				var acc fr.Element
+				acc.SetZero()
+				for i := 0; i < n; i++ {
+					var tmp fr.Element
+					tmp.Mul(&x[i], &msk.B[i][j])
+					acc.Add(&acc, &tmp)
+				}
+				y[j] = acc
+				var eexp fr.Element
+				eexp.Mul(&alpha, &acc)
+				K2[j] = g1Exp(msk.PP.G1Gen, eexp)
+			}
+		}(start, end)
+	}
+	wg.Wait()
 	return SecretKey{K1: K1, K2: K2}, nil
 }
 
@@ -138,36 +166,62 @@ func Encrypt(msk MSK, y []fr.Element) (Ciphertext, error) {
 		return Ciphertext{}, ErrDimensionMismatch
 	}
 
-	// 1) sample β ← Z_q
 	var beta fr.Element
 	if _, err := beta.SetRandom(); err != nil {
 		return Ciphertext{}, err
 	}
 
-	// 2) z = y · B* (row-vector times matrix) ∈ Z_q^n
 	z := make([]fr.Element, n)
-	for j := 0; j < n; j++ {
-		var acc fr.Element
-		acc.SetZero()
-		for i := 0; i < n; i++ {
-			var tmp fr.Element
-			tmp.Mul(&y[i], &msk.Bstar[i][j])
-			acc.Add(&acc, &tmp)
-		}
-		z[j] = acc
-	}
-
-	// 3) C1 = g2^β
-	C1 := g2Exp(msk.PP.G2Gen, beta)
-
-	// 4) C2[j] = g2^{β · z[j]}
 	C2 := make([]bls12381.G2Affine, n)
-	for j := 0; j < n; j++ {
-		var exp fr.Element
-		exp.Mul(&beta, &z[j])
-		C2[j] = g2Exp(msk.PP.G2Gen, exp)
+
+	if n < 32 {
+		for j := 0; j < n; j++ {
+			var acc fr.Element
+			acc.SetZero()
+			for i := 0; i < n; i++ {
+				var tmp fr.Element
+				tmp.Mul(&y[i], &msk.Bstar[i][j])
+				acc.Add(&acc, &tmp)
+			}
+			z[j] = acc
+			var e fr.Element
+			e.Mul(&beta, &acc)
+			C2[j] = g2Exp(msk.PP.G2Gen, e)
+		}
+		C1 := g2Exp(msk.PP.G2Gen, beta)
+		return Ciphertext{C1: C1, C2: C2}, nil
 	}
 
+	workers := runtime.GOMAXPROCS(0)
+	if workers > n {
+		workers = n
+	}
+	chunk := (n + workers - 1) / workers
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if end > n { end = n }
+		go func(s, e int) {
+			defer wg.Done()
+			for j := s; j < e; j++ {
+				var acc fr.Element
+				acc.SetZero()
+				for i := 0; i < n; i++ {
+					var tmp fr.Element
+					tmp.Mul(&y[i], &msk.Bstar[i][j])
+					acc.Add(&acc, &tmp)
+				}
+				z[j] = acc
+				var exp fr.Element
+				exp.Mul(&beta, &acc)
+				C2[j] = g2Exp(msk.PP.G2Gen, exp)
+			}
+		}(start, end)
+	}
+	wg.Wait()
+	C1 := g2Exp(msk.PP.G2Gen, beta)
 	return Ciphertext{C1: C1, C2: C2}, nil
 }
 
