@@ -15,7 +15,7 @@ func main() {
 	fmt.Println()
 	fmt.Println("============================================================")
 	fmt.Println()
-	
+
 	// Run parallel scaling benchmark
 	BenchmarkParallelScaling()
 	fmt.Println()
@@ -26,7 +26,7 @@ func main() {
 	BenchmarkManyKeysOneCiphertext()
 	fmt.Println("============================================================")
 	fmt.Println()
-	
+
 	// Original throughput benchmark
 	runThroughputBenchmark()
 }
