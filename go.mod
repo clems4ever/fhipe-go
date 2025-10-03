@@ -9,5 +9,6 @@ require (
 
 require (
 	github.com/bits-and-blooms/bitset v1.20.0 // indirect
+	github.com/supranational/blst v0.3.16 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 )
