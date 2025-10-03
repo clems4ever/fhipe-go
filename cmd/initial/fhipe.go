@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/gob"
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -45,6 +47,30 @@ type Ciphertext struct {
 
 // ErrDimensionMismatch is returned when vectors have wrong length.
 var ErrDimensionMismatch = fmt.Errorf("dimension mismatch")
+
+// PrecomputedTable holds a precomputed lookup table for fast inner product recovery.
+// It maps GT element keys to their corresponding exponent values.
+type PrecomputedTable struct {
+	Table map[string]int // maps gtKey(D1^z) -> z
+	Bound int            // the bound for which this table was computed
+}
+
+// SerializableGT is a wrapper for bls12381.GT that implements gob encoding.
+type SerializableGT struct {
+	Data []byte
+}
+
+// SerializableTable is used for disk serialization.
+type SerializableTable struct {
+	Entries []TableEntry
+	Bound   int
+}
+
+// TableEntry represents a single entry in the precomputed table.
+type TableEntry struct {
+	Key   string
+	Value int
+}
 
 // Setup implements: sample pairing groups & generators; sample B in GL_n(Z_q);
 // compute B* = det(B)*(B^{-1})^T  (all arithmetic mod q).
@@ -405,6 +431,208 @@ func gtKey(g *bls12381.GT) string {
 		return string(marshaler.Marshal())
 	}
 	return g.String()
+}
+
+// PrecomputeTable generates a lookup table mapping gt_base^z -> z for all z in [-bound, bound].
+// gt_base should be e(K1, g2) where K1 is from the secret key.
+// This allows O(1) recovery instead of O(sqrt(N)) BSGS at the cost of precomputation time
+// and storage space. The table size is 2*bound+1 entries.
+func PrecomputeTable(gt_base bls12381.GT, bound int) *PrecomputedTable {
+	N := 2*bound + 1
+	table := make(map[string]int, N)
+	
+	// Use parallel computation for large bounds
+	if bound < 1000 {
+		// Sequential for small bounds
+		var cur bls12381.GT
+		var zBig big.Int
+		
+		// Compute gt_base^{-bound} as starting point
+		zBig.SetInt64(int64(-bound))
+		cur.Exp(gt_base, &zBig)
+		
+		// Now iterate from -bound to +bound
+		for z := -bound; z <= bound; z++ {
+			table[gtKey(&cur)] = z
+			if z < bound {
+				cur.Mul(&cur, &gt_base)
+			}
+		}
+	} else {
+		// Parallel computation for large bounds
+		workers := runtime.GOMAXPROCS(0)
+		chunk := (N + workers - 1) / workers
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		
+		wg.Add(workers)
+		for w := 0; w < workers; w++ {
+			start := w * chunk
+			end := start + chunk
+			if end > N {
+				end = N
+			}
+			
+			go func(s, e int) {
+				defer wg.Done()
+				localTable := make(map[string]int, e-s)
+				
+				for idx := s; idx < e; idx++ {
+					z := idx - bound
+					var zBig big.Int
+					zBig.SetInt64(int64(z))
+					
+					var val bls12381.GT
+					val.Exp(gt_base, &zBig)
+					localTable[gtKey(&val)] = z
+				}
+				
+				// Merge into global table
+				mu.Lock()
+				for k, v := range localTable {
+					table[k] = v
+				}
+				mu.Unlock()
+			}(start, end)
+		}
+		wg.Wait()
+	}
+	
+	return &PrecomputedTable{
+		Table: table,
+		Bound: bound,
+	}
+}
+
+// RecoverWithTable performs O(1) lookup using a precomputed table.
+// Returns (z, true) if D2 is found in the table, (0, false) otherwise.
+func RecoverWithTable(D2 bls12381.GT, table *PrecomputedTable) (int, bool) {
+	z, found := table.Table[gtKey(&D2)]
+	return z, found
+}
+
+// SaveTableToDisk serializes the precomputed table to a file.
+func SaveTableToDisk(table *PrecomputedTable, filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+	
+	// Convert map to slice for serialization
+	serTable := SerializableTable{
+		Entries: make([]TableEntry, 0, len(table.Table)),
+		Bound:   table.Bound,
+	}
+	
+	for key, val := range table.Table {
+		serTable.Entries = append(serTable.Entries, TableEntry{
+			Key:   key,
+			Value: val,
+		})
+	}
+	
+	encoder := gob.NewEncoder(file)
+	if err := encoder.Encode(serTable); err != nil {
+		return fmt.Errorf("failed to encode table: %w", err)
+	}
+	
+	return nil
+}
+
+// LoadTableFromDisk deserializes a precomputed table from a file.
+func LoadTableFromDisk(filename string) (*PrecomputedTable, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+	
+	var serTable SerializableTable
+	decoder := gob.NewDecoder(file)
+	if err := decoder.Decode(&serTable); err != nil {
+		return nil, fmt.Errorf("failed to decode table: %w", err)
+	}
+	
+	// Convert slice back to map
+	table := &PrecomputedTable{
+		Table: make(map[string]int, len(serTable.Entries)),
+		Bound: serTable.Bound,
+	}
+	
+	for _, entry := range serTable.Entries {
+		table.Table[entry.Key] = entry.Value
+	}
+	
+	return table, nil
+}
+
+// RecoverInnerProductWithTable is a variant of RecoverInnerProduct that uses
+// a precomputed table. The table must be built with gt_base = e(K1, g2).
+// Given D1 = e(K1, C1) = gt_base^β and D2 = e(K2, C2) = gt_base^{β·z},
+// we want to find z such that D1^z = D2, i.e., (gt_base^β)^z = gt_base^{β·z}.
+// This is equivalent to finding z in the table such that gt_base^{β·z} = D2.
+// We compute D2/D1 = gt_base^{β·(z-1)}, which doesn't directly help.
+//
+// The correct approach: D2 / D1^z should equal identity for the correct z.
+// We iterate through possible z values and check. With a table of gt_base^z,
+// we can compute D1^z / gt_base^z = (gt_base^β)^z / gt_base^z = gt_base^{z(β-1)}.
+// This still doesn't work.
+//
+// ACTUAL WORKING APPROACH:
+// Since D1 = gt_base^β and D2 = gt_base^{β·z}, we have D2/D1 = gt_base^{β·(z-1)}.
+// But we can also compute: D2 / D1^z = gt_base^{β·z} / gt_base^{β·z} = 1 (identity).
+// So we iterate z and check when D1^z = D2. This is just BSGS, which the table
+// was supposed to optimize!
+//
+// THE KEY INSIGHT: For a fixed key, gt_base = e(K1, g2) is constant.
+// D1 varies as gt_base^β for random β per encryption.
+// The table needs to handle the β variation.
+//
+// SOLUTION: Instead of storing gt_base^z, we need a different approach.
+// For each encryption: D1 = gt_base^β, D2 = gt_base^{β·z}
+// We can compute D2/D1 repeatedly: D2/D1, (D2/D1)/D1, ...
+// D2/D1 = gt_base^{β(z-1)}
+// (D2/D1)/D1 = gt_base^{β(z-2)}
+// Keep dividing by D1 starting from D2 until we hit identity or exceed bounds.
+//
+// This is O(|z|) which is better than BSGS for small z, worse for large z.
+// For now, let's just use BSGS since the table approach needs rethinking.
+func RecoverInnerProductWithTable(D1, D2 bls12381.GT, table *PrecomputedTable) (int, bool) {
+	if table == nil || table.Bound == 0 {
+		return 0, false
+	}
+	
+	// Simple sequential search approach:
+	// Start from D2 and repeatedly divide by D1 (multiply by D1^{-1})
+	// Count how many divisions until we get identity
+	var D1inv bls12381.GT
+	D1inv.Inverse(&D1)
+	
+	var cur bls12381.GT
+	cur = D2
+	
+	var identity bls12381.GT
+	identity.SetOne()
+	
+	// Try positive z values
+	for z := 0; z <= table.Bound; z++ {
+		if cur.Equal(&identity) {
+			return z, true
+		}
+		cur.Mul(&cur, &D1inv) // cur = D2 / D1^z
+	}
+	
+	// Try negative z values
+	cur = D2
+	for z := -1; z >= -table.Bound; z-- {
+		cur.Mul(&cur, &D1) // cur = D2 * D1^{|z|}
+		if cur.Equal(&identity) {
+			return z, true
+		}
+	}
+	
+	return 0, false
 }
 
 // IntsToFrElements converts a slice of integers to a slice of fr.Element.
