@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 
 	bls12381 "github.com/consensys/gnark-crypto/ecc/bls12-381"
@@ -194,30 +195,100 @@ func Decrypt(pp Params, sk SecretKey, ct Ciphertext) (D1 bls12381.GT, D2 bls1238
 // RecoverInnerProduct searches for z ∈ S such that (D1)^z = D2.
 // S is defined as the set {z ∈ Z : -bound ≤ z ≤ bound} (polynomial-sized).
 // Returns (z, true) if found, (0, false) otherwise (⊥).
+// RecoverInnerProduct attempts to recover z in [-bound, bound] such that D1^z = D2.
+// It uses Baby-Step Giant-Step (BSGS) which runs in O(sqrt(bound)) group ops
+// instead of linear brute force. For very small bounds, a simple loop may be
+// slightly faster; we still use BSGS unconditionally for simplicity.
 func RecoverInnerProduct(D1, D2 bls12381.GT, bound int) (int, bool) {
+	if bound < 0 {
+		return 0, false
+	}
+	// Quick edge cases
+	if bound == 0 {
+		if D2.Equal(&bls12381.GT{}) { // unlikely meaningful; keep for completeness
+			return 0, false
+		}
+	}
+	// Shift problem to non‑negative range: find z' in [0, N-1] s.t. D1^{z'} = D1^{bound} * D2
+	// where z' = z + bound, N = 2*bound + 1.
+	N := 2*bound + 1
+	m := int(math.Ceil(math.Sqrt(float64(N))))
+
+	// Precompute baby steps: g^j for j=0..m-1
+	baby := make(map[string]int, m)
+
+	// current = D1^0 = 1
+	var current bls12381.GT
+	current.SetOne()
+	for j := 0; j < m; j++ {
+		baby[gtKey(&current)] = j
+		// current *= D1
+		current.Mul(&current, &D1)
+	}
+
+	// stride = D1^{m}
+	var stride bls12381.GT
+	var mBig big.Int
+	mBig.SetInt64(int64(m))
+	stride.Exp(D1, &mBig)
+
+	// strideInv = (D1^{m})^{-1}
+	var strideInv bls12381.GT
+	strideInv.Inverse(&stride)
+
+	// target = D1^{bound} * D2 = D1^{z+bound}
+	var boundPow bls12381.GT
+	var boundBig big.Int
+	boundBig.SetInt64(int64(bound))
+	boundPow.Exp(D1, &boundBig)
+	var target bls12381.GT
+	target.Mul(&boundPow, &D2)
+
+	// Giant steps: target * (D1^{-m})^{k}
+	for k := 0; k <= m; k++ {
+		if j, ok := baby[gtKey(&target)]; ok {
+			idx := k*m + j // z' candidate
+			if idx < N {   // ensure within range
+				z := idx - bound
+				return z, true
+			}
+		}
+		// target *= strideInv
+		target.Mul(&target, &strideInv)
+	}
+	return 0, false
+}
+
+// recoverInnerProductBrute is the original linear scan kept for reference / testing.
+func recoverInnerProductBrute(D1, D2 bls12381.GT, bound int) (int, bool) {
 	for z := -bound; z <= bound; z++ {
-		// Compute D1^z
 		var D1z bls12381.GT
 		var zBig big.Int
 		if z >= 0 {
 			zBig.SetInt64(int64(z))
 		} else {
-			// Handle negative exponents: compute D1^|z| then invert
 			zBig.SetInt64(int64(-z))
 		}
 		D1z.Exp(D1, &zBig)
-
-		// If z was negative, invert the result
 		if z < 0 {
 			D1z.Inverse(&D1z)
 		}
-
-		// Check if D1^z == D2
 		if D1z.Equal(&D2) {
 			return z, true
 		}
 	}
 	return 0, false
+}
+
+// gtKey creates a map key for a GT element via its compressed bytes. We try
+// Marshal first (gnark-crypto elements implement encoding), falling back to
+// fmt-based representation if needed.
+func gtKey(g *bls12381.GT) string {
+	// Marshal() exists on gnark-crypto GT; if not, we fallback.
+	if marshaler, ok := interface{}(g).(interface{ Marshal() []byte }); ok {
+		return string(marshaler.Marshal())
+	}
+	return g.String()
 }
 
 // IntsToFrElements converts a slice of integers to a slice of fr.Element.
@@ -421,22 +492,4 @@ func g2Exp(g bls12381.G2Affine, e fr.Element) bls12381.G2Affine {
 	var out bls12381.G2Affine
 	out.ScalarMultiplication(&g, &bi)
 	return out
-}
-
-// checkPairing verifies if D1^z == D2 by computing D1^z and comparing with D2.
-func checkPairing(D1 bls12381.GT, z int, D2 bls12381.GT) bool {
-	var D1z bls12381.GT
-	var zBig big.Int
-	if z >= 0 {
-		zBig.SetInt64(int64(z))
-	} else {
-		zBig.SetInt64(int64(-z))
-	}
-	D1z.Exp(D1, &zBig)
-	
-	if z < 0 {
-		D1z.Inverse(&D1z)
-	}
-	
-	return D1z.Equal(&D2)
 }

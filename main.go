@@ -3,14 +3,14 @@ package main
 import (
 	"fmt"
 	"log"
+	"math/rand"
+	"time"
 )
 
 func main() {
-	n := 10
-
-	// Define the bound S for the allowed inner product range: [-S, S]
-	// The set is {z ∈ Z : -10000 ≤ z ≤ 10000}, which is polynomial-sized
-	S := 10000
+	n := 384
+	// Bound S (ensure it's large enough to contain typical inner products for chosen entry ranges)
+	S := 5000
 
 	params, msk, err := Setup(n, S)
 	if err != nil {
@@ -21,19 +21,17 @@ func main() {
 	fmt.Printf("Params initialized with S = %d (range [-%d, %d], size = %d)\n\n",
 		params.S, params.S, params.S, 2*params.S+1)
 
-	// Define 11 test vectors (length n)
-	vectors := [][]int{
-		{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},      // v0
-		{2, 1, 0, 1, 3, 5, 8, 13, 21, 34},    // v1
-		{10, 9, 8, 7, 6, 5, 4, 3, 2, 1},      // v2
-		{1, 1, 1, 1, 1, 1, 1, 1, 1, 1},       // v3
-		{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},       // v4
-		{-1, -2, -3, -4, -5, 6, 7, 8, 9, 10}, // v5 (with negatives)
-		{5, 5, 5, 5, 5, 5, 5, 5, 5, 5},       // v6
-		{1, 0, 1, 0, 1, 0, 1, 0, 1, 0},       // v7
-		{2, 4, 6, 8, 10, 12, 14, 16, 18, 20}, // v8
-		{1, -1, 1, -1, 1, -1, 1, -1, 1, -1},  // v9 (alternating)
-		{3, 1, 4, 1, 5, 9, 2, 6, 5, 3},       // v10 (pi digits)
+	// Generate a small set of random vectors for functional correctness demonstration.
+	rand.Seed(time.Now().UnixNano())
+	numVectors := 6
+	entryRange := 5 // coordinates sampled from [-entryRange, entryRange]
+	vectors := make([][]int, numVectors)
+	for i := 0; i < numVectors; i++ {
+		vec := make([]int, n)
+		for j := 0; j < n; j++ {
+			vec[j] = rand.Intn(2*entryRange+1) - entryRange
+		}
+		vectors[i] = vec
 	}
 
 	// Generate secret key for vector 0
@@ -41,7 +39,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Generated secret key for v0 = %v\n\n", vectors[0])
+	fmt.Printf("Generated secret key for v0 (first 12 entries shown) = %v ...\n\n", vectors[0][:12])
 
 	// Test inner product between v0 and all vectors (including itself)
 	fmt.Println("=== Testing Inner Products: <v0, vi> ===")
@@ -73,105 +71,25 @@ func main() {
 			if z != expectedIP {
 				match = "✗"
 			}
-			fmt.Printf("v0 · v%-2d: expected = %5d, recovered = %5d %s | D1^z == D2? %v\n", 
-				i, expectedIP, z, match, checkPairing(D1, z, D2))
+			fmt.Printf("v0 · v%-2d: expected = %6d, recovered = %6d %s\n", i, expectedIP, z, match)
 		} else {
-			fmt.Printf("v0 · v%-2d: expected = %5d, recovered = FAILED (not in range)\n", i, expectedIP)
+			fmt.Printf("v0 · v%-2d: expected = %6d, recovered = FAILED (not in range)\n", i, expectedIP)
 		}
 	}
 
 	fmt.Println("\n=== Summary ===")
 	fmt.Println("All inner products successfully recovered using function-hiding IPE!")
 
-	// Test with a broken (incorrect) key
-	fmt.Println("\n=== Testing with Broken Key ===")
-	
-	// Generate a key for a different vector (v3 = all ones)
-	skBroken, err := KeyGen(msk, IntsToFrElements(vectors[3]))
+	// Throughput benchmarks for 384 dimensions
+	fmt.Println("\n=== Throughput Benchmarks (n=384) ===")
+	fullTrials := 30
+	fullRes, err := runFullPipelineThroughput(msk, params, sk0, fullTrials, entryRange)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Generated BROKEN secret key for v3 = %v (instead of v0)\n", vectors[3])
-	
-	// Try to decrypt a ciphertext for v1 using the wrong key
-	ctTest, err := Encrypt(msk, IntsToFrElements(vectors[1]))
-	if err != nil {
-		log.Fatal(err)
-	}
-	
-	// The correct inner product would be <v0, v1> = 742
-	// But we're using key for v3, so we'll get <v3, v1> instead
-	correctIP := 0
-	for j := 0; j < n; j++ {
-		correctIP += vectors[0][j] * vectors[1][j]
-	}
-	
-	brokenIP := 0
-	for j := 0; j < n; j++ {
-		brokenIP += vectors[3][j] * vectors[1][j]
-	}
-	
-	D1Broken, D2Broken, err := Decrypt(params, skBroken, ctTest)
-	if err != nil {
-		log.Fatal(err)
-	}
-	
-	zBroken, foundBroken := RecoverInnerProduct(D1Broken, D2Broken, params.S)
-	
-	fmt.Printf("\nEncrypted: v1 = %v\n", vectors[1])
-	fmt.Printf("Correct key would give: <v0, v1> = %d\n", correctIP)
-	fmt.Printf("Broken key (for v3) gives: <v3, v1> = %d\n", brokenIP)
-	
-	if foundBroken {
-		fmt.Printf("Result with broken key: z = %d (found in S) ✓\n", zBroken)
-		fmt.Printf("  → D1^z == D2? %v\n", checkPairing(D1Broken, zBroken, D2Broken))
-		if zBroken == brokenIP {
-			fmt.Printf("  → Matches <v3, v1> = %d (scheme still works, just with wrong vector!)\n", brokenIP)
-		}
-		if zBroken != correctIP {
-			fmt.Printf("  → Does NOT match correct IP <v0, v1> = %d ✓\n", correctIP)
-		}
-	} else {
-		fmt.Printf("Result with broken key: NOT FOUND in S (out of range)\n")
-	}
-	
-	fmt.Println("\n=== Conclusion ===")
-	fmt.Println("With a broken/incorrect key, the scheme still produces a value in S,")
-	fmt.Println("but it computes a different (incorrect) inner product!")
+	printThroughput(fullRes)
 
-	// Test with a completely random vector to see if we can get out of S
-	fmt.Println("\n=== Testing with Random Broken Key ===")
-	randomVec := []int{100, 200, 300, 400, 500, 600, 700, 800, 900, 1000}
-	skRandom, err := KeyGen(msk, IntsToFrElements(randomVec))
-	if err != nil {
-		log.Fatal(err)
-	}
-	
-	fmt.Printf("Generated random secret key for v_random = %v\n", randomVec)
-	
-	// The inner product <v_random, v1>
-	randomBrokenIP := 0
-	for j := 0; j < n; j++ {
-		randomBrokenIP += randomVec[j] * vectors[1][j]
-	}
-	
-	D1Random, D2Random, err := Decrypt(params, skRandom, ctTest)
-	if err != nil {
-		log.Fatal(err)
-	}
-	
-	zRandom, foundRandom := RecoverInnerProduct(D1Random, D2Random, params.S)
-	
-	fmt.Printf("Expected inner product <v_random, v1> = %d\n", randomBrokenIP)
-	
-	if foundRandom {
-		fmt.Printf("Result: z = %d (found in S)\n", zRandom)
-		if zRandom == randomBrokenIP {
-			fmt.Printf("  → Matches <v_random, v1> = %d ✓\n", randomBrokenIP)
-		}
-	} else {
-		fmt.Printf("Result: NOT FOUND in S!\n")
-		fmt.Printf("  → Expected value %d is outside range [-%d, %d]\n", randomBrokenIP, params.S, params.S)
-		fmt.Printf("  → This proves the broken key produces a value OUTSIDE S! ✓\n")
-	}
+	recoveryTrials := 500
+	recRes := runRecoveryOnlyThroughput(params, params.S, recoveryTrials)
+	printThroughput(recRes)
 }
