@@ -259,27 +259,6 @@ func RecoverInnerProduct(D1, D2 bls12381.GT, bound int) (int, bool) {
 	return 0, false
 }
 
-// recoverInnerProductBrute is the original linear scan kept for reference / testing.
-func recoverInnerProductBrute(D1, D2 bls12381.GT, bound int) (int, bool) {
-	for z := -bound; z <= bound; z++ {
-		var D1z bls12381.GT
-		var zBig big.Int
-		if z >= 0 {
-			zBig.SetInt64(int64(z))
-		} else {
-			zBig.SetInt64(int64(-z))
-		}
-		D1z.Exp(D1, &zBig)
-		if z < 0 {
-			D1z.Inverse(&D1z)
-		}
-		if D1z.Equal(&D2) {
-			return z, true
-		}
-	}
-	return 0, false
-}
-
 // gtKey creates a map key for a GT element via its compressed bytes. We try
 // Marshal first (gnark-crypto elements implement encoding), falling back to
 // fmt-based representation if needed.
