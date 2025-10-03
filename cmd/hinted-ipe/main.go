@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"runtime"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
@@ -223,6 +224,76 @@ func restrictedSearch(base bn254.GT, target bn254.GT, bound int64, x0 int64, M i
 	return 0, false
 }
 
+// parallelDecryptRecover performs pairing aggregation + residue recovery + restricted search
+// in parallel for a batch of ciphertexts. It returns the number of failures and per-phase timings.
+func parallelDecryptRecover(pp *PublicParams, key *Key, cts []*Ciphertext, trueVals []*big.Int, bound int64, workers int) (failures int, pairingTime, residueTime, searchTime time.Duration) {
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	type job struct{ idx int }
+	type result struct {
+		fail                     bool
+		tPair, tResidue, tSearch time.Duration
+	}
+
+	jobs := make(chan job, len(cts))
+	results := make(chan result, len(cts))
+
+	// Precompute base pairing element once
+	basePair, err := bn254.Pair([]bn254.G1Affine{pp.g1}, []bn254.G2Affine{pp.g2})
+	if err != nil {
+		panic(err)
+	}
+
+	workerFn := func() {
+		for jb := range jobs {
+			ct := cts[jb.idx]
+			startPair := time.Now()
+			Z, err := PairingAggregate(pp, ct, key)
+			tPair := time.Since(startPair)
+			if err != nil {
+				results <- result{fail: true, tPair: tPair}
+				continue
+			}
+
+			startResidue := time.Now()
+			residues := recoverResidues(pp, ct.hints)
+			tResidue := time.Since(startResidue)
+			crtRep := crt(residues, hintPrimes)
+			M := int64(1)
+			for _, p := range hintPrimes {
+				M *= p
+			}
+			x0 := crtRep.Int64()
+
+			startSearch := time.Now()
+			found, ok := restrictedSearch(basePair, Z, bound, x0, M)
+			tSearch := time.Since(startSearch)
+
+			fail := !ok || big.NewInt(found).Cmp(trueVals[jb.idx]) != 0
+			results <- result{fail: fail, tPair: tPair, tResidue: tResidue, tSearch: tSearch}
+		}
+	}
+
+	for w := 0; w < workers; w++ {
+		go workerFn()
+	}
+	for i := range cts {
+		jobs <- job{idx: i}
+	}
+	close(jobs)
+	for i := 0; i < len(cts); i++ {
+		r := <-results
+		if r.fail {
+			failures++
+		}
+		pairingTime += r.tPair
+		residueTime += r.tResidue
+		searchTime += r.tSearch
+	}
+	return
+}
+
 func main() {
 	fmt.Println("=== Minimal IPE + Structured Hints Demo ===")
 	// ------------------------------------------------------------------
@@ -309,7 +380,7 @@ func main() {
 	// ------------------------------------------------------------------
 	fmt.Println("\n=== THROUGHPUT BENCHMARK (100 vectors, n=384) ===")
 	benchN := 384
-	numVectors := 100
+	numVectors := 1000
 	benchBound := int64(1_000_000) // keep consistent; real scenarios may use much larger
 	ppBench, _ := Setup(benchN)
 	// Fixed y across all ciphertexts (common in many IPE usage patterns)
@@ -344,32 +415,12 @@ func main() {
 	}
 	encDur := time.Since(startEnc)
 
-	// Base pairing constant
-	basePairBench, err := bn254.Pair([]bn254.G1Affine{ppBench.g1}, []bn254.G2Affine{ppBench.g2})
-	if err != nil {
-		panic(err)
-	}
+	// Base pairing constant omitted here; computed inside workers once per worker
 
-	// Decryption + recovery benchmark
+	// Decryption + recovery benchmark (parallel)
+	workers := runtime.NumCPU()
 	startDec := time.Now()
-	recoverFailures := 0
-	for v := 0; v < numVectors; v++ {
-		Zb, err := PairingAggregate(ppBench, ctBench[v], keyBench)
-		if err != nil {
-			panic(err)
-		}
-		res := recoverResidues(ppBench, ctBench[v].hints)
-		crtRepV := crt(res, hintPrimes)
-		Mv := int64(1)
-		for _, p := range hintPrimes {
-			Mv *= p
-		}
-		x0v := crtRepV.Int64()
-		found, ok := restrictedSearch(basePairBench, Zb, benchBound, x0v, Mv)
-		if !ok || big.NewInt(found).Cmp(trueInner[v]) != 0 {
-			recoverFailures++
-		}
-	}
+	failures, pairTime, residueTime, searchTime := parallelDecryptRecover(ppBench, keyBench, ctBench, trueInner, benchBound, workers)
 	decDur := time.Since(startDec)
 
 	encThroughput := float64(numVectors) / encDur.Seconds()
@@ -378,8 +429,11 @@ func main() {
 	fmt.Println("\n--- Benchmark Summary ---")
 	fmt.Printf("Dimension: %d, Vectors: %d\n", benchN, numVectors)
 	fmt.Printf("Encryption total: %v | avg: %v | throughput: %.2f ops/sec\n", encDur, encDur/time.Duration(numVectors), encThroughput)
-	fmt.Printf("Decryption+Recovery total: %v | avg: %v | throughput: %.2f ops/sec\n", decDur, decDur/time.Duration(numVectors), decThroughput)
-	fmt.Printf("Failures in recovery: %d\n", recoverFailures)
+	fmt.Printf("Decryption+Recovery total: %v | avg: %v | throughput: %.2f ops/sec | workers=%d\n", decDur, decDur/time.Duration(numVectors), decThroughput, workers)
+	fmt.Printf("  Pairing time:   %v (%.1f%%)\n", pairTime, 100*pairTime.Seconds()/decDur.Seconds())
+	fmt.Printf("  Residue time:   %v (%.1f%%)\n", residueTime, 100*residueTime.Seconds()/decDur.Seconds())
+	fmt.Printf("  Search time:    %v (%.1f%%)\n", searchTime, 100*searchTime.Seconds()/decDur.Seconds())
+	fmt.Printf("Failures in recovery: %d\n", failures)
 	fmt.Printf("Hint primes: %v (product=%d)\n", hintPrimes, M)
 	fmt.Println("--------------------------")
 }
