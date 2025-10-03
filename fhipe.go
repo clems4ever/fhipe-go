@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	bls12381 "github.com/consensys/gnark-crypto/ecc/bls12-381"
 	"github.com/consensys/gnark-crypto/ecc/bls12-381/fr"
@@ -202,7 +203,9 @@ func Encrypt(msk MSK, y []fr.Element) (Ciphertext, error) {
 	for w := 0; w < workers; w++ {
 		start := w * chunk
 		end := start + chunk
-		if end > n { end = n }
+		if end > n {
+			end = n
+		}
 		go func(s, e int) {
 			defer wg.Done()
 			for j := s; j < e; j++ {
@@ -257,58 +260,138 @@ func RecoverInnerProduct(D1, D2 bls12381.GT, bound int) (int, bool) {
 	if bound < 0 {
 		return 0, false
 	}
-	// Quick edge cases
-	if bound == 0 {
-		if D2.Equal(&bls12381.GT{}) { // unlikely meaningful; keep for completeness
-			return 0, false
-		}
+	// For small bounds, sequential BSGS often faster due to overhead.
+	if bound <= 256 { // adjustable threshold
+		return recoverInnerProductSeq(D1, D2, bound)
 	}
-	// Shift problem to non‑negative range: find z' in [0, N-1] s.t. D1^{z'} = D1^{bound} * D2
-	// where z' = z + bound, N = 2*bound + 1.
+	return recoverInnerProductParallel(D1, D2, bound)
+}
+
+// Sequential BSGS (original logic) extracted for reuse.
+func recoverInnerProductSeq(D1, D2 bls12381.GT, bound int) (int, bool) {
 	N := 2*bound + 1
 	m := int(math.Ceil(math.Sqrt(float64(N))))
 
-	// Precompute baby steps: g^j for j=0..m-1
 	baby := make(map[string]int, m)
-
-	// current = D1^0 = 1
-	var current bls12381.GT
-	current.SetOne()
+	var cur bls12381.GT
+	cur.SetOne()
 	for j := 0; j < m; j++ {
-		baby[gtKey(&current)] = j
-		// current *= D1
-		current.Mul(&current, &D1)
+		baby[gtKey(&cur)] = j
+		cur.Mul(&cur, &D1)
 	}
-
-	// stride = D1^{m}
 	var stride bls12381.GT
 	var mBig big.Int
 	mBig.SetInt64(int64(m))
 	stride.Exp(D1, &mBig)
-
-	// strideInv = (D1^{m})^{-1}
 	var strideInv bls12381.GT
 	strideInv.Inverse(&stride)
-
-	// target = D1^{bound} * D2 = D1^{z+bound}
 	var boundPow bls12381.GT
 	var boundBig big.Int
 	boundBig.SetInt64(int64(bound))
 	boundPow.Exp(D1, &boundBig)
 	var target bls12381.GT
 	target.Mul(&boundPow, &D2)
-
-	// Giant steps: target * (D1^{-m})^{k}
 	for k := 0; k <= m; k++ {
 		if j, ok := baby[gtKey(&target)]; ok {
-			idx := k*m + j // z' candidate
-			if idx < N {   // ensure within range
-				z := idx - bound
-				return z, true
+			idx := k*m + j
+			if idx < N {
+				return idx - bound, true
 			}
 		}
-		// target *= strideInv
 		target.Mul(&target, &strideInv)
+	}
+	return 0, false
+}
+
+// Parallel BSGS: splits giant steps across workers.
+func recoverInnerProductParallel(D1, D2 bls12381.GT, bound int) (int, bool) {
+	N := 2*bound + 1
+	m := int(math.Ceil(math.Sqrt(float64(N))))
+
+	// Baby steps
+	baby := make(map[string]int, m)
+	var cur bls12381.GT
+	cur.SetOne()
+	for j := 0; j < m; j++ {
+		baby[gtKey(&cur)] = j
+		cur.Mul(&cur, &D1)
+	}
+
+	// Precompute stride and its inverse
+	var stride bls12381.GT
+	var mBig big.Int
+	mBig.SetInt64(int64(m))
+	stride.Exp(D1, &mBig)
+	var strideInv bls12381.GT
+	strideInv.Inverse(&stride)
+
+	// target0 = D1^{bound} * D2
+	var boundPow bls12381.GT
+	var boundBig big.Int
+	boundBig.SetInt64(int64(bound))
+	boundPow.Exp(D1, &boundBig)
+	var target0 bls12381.GT
+	target0.Mul(&boundPow, &D2)
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > m+1 { // no need for more workers than iterations
+		workers = m + 1
+	}
+	if workers < 2 { // fallback sequentially
+		return recoverInnerProductSeq(D1, D2, bound)
+	}
+
+	// Partition k in [0, m]
+	chunk := (m + workers) / workers
+	var found int32
+	var result int32
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	// Precompute powers of strideInv^chunk for jump starting chunks efficiently.
+	// strideChunk = strideInv^{chunk}
+	var strideChunk bls12381.GT
+	var chunkBig big.Int
+	chunkBig.SetInt64(int64(chunk))
+	strideChunk.Exp(strideInv, &chunkBig)
+
+	// For each worker compute starting target = target0 * strideInv^{start}
+	for w := 0; w < workers; w++ {
+		startK := w * chunk
+		endK := startK + chunk
+		if endK > m+1 {
+			endK = m + 1
+		}
+		if startK >= endK {
+			wg.Done()
+			continue
+		}
+		go func(sK, eK int) {
+			defer wg.Done()
+			// Compute strideInv^{sK} via repeated squaring / fast exp
+			var pow bls12381.GT
+			var expBig big.Int
+			expBig.SetInt64(int64(sK))
+			pow.Exp(strideInv, &expBig)
+			var target bls12381.GT
+			target.Mul(&target0, &pow)
+			for k := sK; k < eK && atomic.LoadInt32(&found) == 0; k++ {
+				if j, ok := baby[gtKey(&target)]; ok {
+					idx := k*m + j
+					if idx < N {
+						if atomic.CompareAndSwapInt32(&found, 0, 1) {
+							atomic.StoreInt32(&result, int32(idx-bound))
+						}
+						return
+					}
+				}
+				target.Mul(&target, &strideInv)
+			}
+		}(startK, endK)
+	}
+	wg.Wait()
+	if atomic.LoadInt32(&found) == 1 {
+		return int(atomic.LoadInt32(&result)), true
 	}
 	return 0, false
 }

@@ -3,8 +3,11 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"time"
+
+	"github.com/consensys/gnark-crypto/ecc/bls12-381/fr"
 )
 
 func main() {
@@ -92,4 +95,87 @@ func main() {
 	recoveryTrials := 500
 	recRes := runRecoveryOnlyThroughput(params, params.S, recoveryTrials)
 	printThroughput(recRes)
+
+	// Floating-point example using fixed-point encoding
+	fmt.Println("\n=== Floating-Point Example (Fixed-Point Encoding) ===")
+	// Suppose we have two real-valued vectors a, b of length m (use smaller m for display)
+	m := 12
+	aFloat := []float64{0.125, -1.75, 2.5, 3.1415, -0.3333, 1.0, -2.25, 4.5, 0.0625, -0.5, 1.75, -3.0}
+	bFloat := []float64{1.5, 0.25, -2.0, 0.5, -1.125, 2.25, 3.0, -0.75, 0.875, -1.0, 0.0, 1.0}
+
+	// Choose a scale for ~4 decimal digits precision
+	enc, _ := NewFixedPointEncoder(10000)
+
+	// Encode (pad to n=384 by zeros so we can reuse the same public parameters)
+	padAndEncode := func(fv []float64) ([]fr.Element, []int64) {
+		full := make([]float64, n)
+		copy(full, fv)
+		fe, ints, err := enc.EncodeFloatVector(full)
+		if err != nil {
+			log.Fatal(err)
+		}
+		return fe, ints
+	}
+
+	aElems, aInts := padAndEncode(aFloat)
+	bElems, bInts := padAndEncode(bFloat)
+
+	// KeyGen for a (treat as the secret vector)
+	// Compute a bound for the (scaled) inner product over the first m entries.
+	maxAbsA, maxAbsB := 0.0, 0.0
+	for i := 0; i < m; i++ {
+		if math.Abs(aFloat[i]) > maxAbsA {
+			maxAbsA = math.Abs(aFloat[i])
+		}
+		if math.Abs(bFloat[i]) > maxAbsB {
+			maxAbsB = math.Abs(bFloat[i])
+		}
+	}
+	floatBound := BoundForScaledInnerProduct(m, maxAbsA, maxAbsB, enc, enc)
+	// Use a safety margin factor.
+	floatBound = int(float64(floatBound)*1.2) + 1
+	if floatBound < 10 {
+		floatBound = 10
+	}
+	fmt.Printf("Float example required bound (scaled) ≈ %d\n", floatBound)
+
+	// Create a dedicated params/msk for the float example (dimension n, but first m used)
+	_, mskFloat, err := Setup(n, floatBound)
+	if err != nil {
+		log.Fatal(err)
+	}
+	skA, err := KeyGen(mskFloat, aElems)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctB, err := Encrypt(mskFloat, bElems)
+	if err != nil {
+		log.Fatal(err)
+	}
+	D1f, D2f, err := Decrypt(mskFloat.PP, skA, ctB)
+	if err != nil {
+		log.Fatal(err)
+	}
+	zScaled, ok := RecoverInnerProduct(D1f, D2f, mskFloat.PP.S)
+	if !ok {
+		fmt.Println("Recovered inner product not in new S (unexpected)")
+	} else {
+		// Compute expected scaled integer inner product over first m entries only
+		var expectedScaled int64
+		for i := 0; i < m; i++ {
+			expectedScaled += aInts[i] * bInts[i]
+		}
+		// Decode to float
+		decoded := DecodeInnerProduct(zScaled, enc, enc)
+		// True real inner product (first m entries)
+		var realIP float64
+		for i := 0; i < m; i++ {
+			realIP += aFloat[i] * bFloat[i]
+		}
+		fmt.Printf("Scaled integer recovered z = %d (S=%d)\n", zScaled, mskFloat.PP.S)
+		fmt.Printf("Expected scaled (manual)  = %d\n", expectedScaled)
+		fmt.Printf("Decoded approximate value = %.6f\n", decoded)
+		fmt.Printf("Actual real inner product = %.6f\n", realIP)
+		fmt.Printf("Absolute error            = %.6g\n", math.Abs(decoded-realIP))
+	}
 }
