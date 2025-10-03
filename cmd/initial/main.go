@@ -10,19 +10,30 @@ import (
 )
 
 func main() {
+	// Test different dimensions
+	BenchmarkDimensions()
+	fmt.Println()
+	fmt.Println("============================================================")
+	fmt.Println()
+	
 	// Run parallel scaling benchmark
 	BenchmarkParallelScaling()
 	fmt.Println()
 	fmt.Println("============================================================")
 	fmt.Println()
 
+	// Many keys / single ciphertext benchmark
+	BenchmarkManyKeysOneCiphertext()
+	fmt.Println("============================================================")
+	fmt.Println()
+	
 	// Original throughput benchmark
 	runThroughputBenchmark()
 }
 
 func runThroughputBenchmark() {
 	n := 384   // dimension of vectors
-	S := 40000 // bound for inner product range [-S, S] (384 * 10 * 10 = 38400 max)
+	S := 80000 // bound for inner product range [-S, S] (384 * 10 * 10 = 38400 max)
 
 	fmt.Println("=== FHIPE Throughput Benchmark ===")
 	fmt.Printf("Vector dimension: %d\n", n)
