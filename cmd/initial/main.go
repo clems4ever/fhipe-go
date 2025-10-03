@@ -10,11 +10,6 @@ import (
 )
 
 func main() {
-	// BLST benchmark (faster implementation)
-	BenchmarkBlst()
-	fmt.Println("============================================================")
-	fmt.Println()
-
 	// Test different dimensions
 	BenchmarkDimensions()
 	fmt.Println()
