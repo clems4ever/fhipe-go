@@ -422,3 +422,21 @@ func g2Exp(g bls12381.G2Affine, e fr.Element) bls12381.G2Affine {
 	out.ScalarMultiplication(&g, &bi)
 	return out
 }
+
+// checkPairing verifies if D1^z == D2 by computing D1^z and comparing with D2.
+func checkPairing(D1 bls12381.GT, z int, D2 bls12381.GT) bool {
+	var D1z bls12381.GT
+	var zBig big.Int
+	if z >= 0 {
+		zBig.SetInt64(int64(z))
+	} else {
+		zBig.SetInt64(int64(-z))
+	}
+	D1z.Exp(D1, &zBig)
+	
+	if z < 0 {
+		D1z.Inverse(&D1z)
+	}
+	
+	return D1z.Equal(&D2)
+}
