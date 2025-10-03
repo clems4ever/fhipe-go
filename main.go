@@ -1,4 +1,4 @@
-package main // Params are the public parameters (you'll add more as your scheme needs).
+package main
 
 import (
 	"fmt"
@@ -13,9 +13,9 @@ import (
 type Params struct {
 	G1Gen bls12381.G1Affine
 	G2Gen bls12381.G2Affine
-	// You can stash S (the subset of Z_q you accept) if you like:
-	// S is the subset of Z_q accepted for inner products (polynomial-sized set)
-	S []int
+	// S is the bound for the allowed inner product range: [-S, S]
+	// The set S = {z ∈ Z : -S ≤ z ≤ S} is polynomial-sized
+	S int
 }
 
 // MSK is the master secret key for setup (keep B, Bstar secret).
@@ -27,7 +27,8 @@ type MSK struct {
 
 // Setup implements: sample pairing groups & generators; sample B in GL_n(Z_q);
 // compute B* = det(B)*(B^{-1})^T  (all arithmetic mod q).
-func Setup(n int) (Params, MSK, error) {
+// S is the bound for the allowed inner product set: {z ∈ Z : -S ≤ z ≤ S}.
+func Setup(n int, S int) (Params, MSK, error) {
 	if n <= 0 {
 		return Params{}, MSK{}, fmt.Errorf("n must be > 0")
 	}
@@ -35,7 +36,7 @@ func Setup(n int) (Params, MSK, error) {
 	// 1) Curve generators (type-3 pairing groups)
 	_, _, g1, g2 := bls12381.Generators()
 
-	pp := Params{G1Gen: g1, G2Gen: g2}
+	pp := Params{G1Gen: g1, G2Gen: g2, S: S}
 
 	// 2) Sample an invertible matrix B over Z_q and compute its inverse & determinant
 	B, invB, detB, err := randInvertibleMatrix(n)
@@ -377,10 +378,10 @@ func Decrypt(pp Params, sk SecretKey, ct Ciphertext) (D1 bls12381.GT, D2 bls1238
 }
 
 // RecoverInnerProduct searches for z ∈ S such that (D1)^z = D2.
-// S is the allowed set of inner product values (typically a small polynomial-sized set).
+// S is defined as the set {z ∈ Z : -bound ≤ z ≤ bound} (polynomial-sized).
 // Returns (z, true) if found, (0, false) otherwise (⊥).
-func RecoverInnerProduct(D1, D2 bls12381.GT, S []int) (int, bool) {
-	for _, z := range S {
+func RecoverInnerProduct(D1, D2 bls12381.GT, bound int) (int, bool) {
+	for z := -bound; z <= bound; z++ {
 		// Compute D1^z
 		var D1z bls12381.GT
 		var zBig big.Int
@@ -428,22 +429,17 @@ func IntsToFrElements(ints []int) []fr.Element {
 func main() {
 	n := 10
 
-	// Define the allowed set S for inner products (polynomial-sized)
-	// For this example, let's use a range from -1000 to 1000
-	S := make([]int, 2001)
-	for i := range S {
-		S[i] = i - 1000
-	}
+	// Define the bound S for the allowed inner product range: [-S, S]
+	// The set is {z ∈ Z : -1000 ≤ z ≤ 1000}, which is polynomial-sized
+	S := 1000
 
-	params, msk, err := Setup(n)
+	params, msk, err := Setup(n, S)
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Store S in params
-	params.S = S
-	msk.PP.S = S
 
-	fmt.Println("Params initialized with |S| =", len(params.S))
+	fmt.Printf("Params initialized with S = %d (range [-%d, %d], size = %d)\n",
+		params.S, params.S, params.S, 2*params.S+1)
 
 	// Example x, y vectors (length n)
 	xInts := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
@@ -485,6 +481,6 @@ func main() {
 			fmt.Printf("✗ WARNING: Recovered z=%d != expected=%d\n", z, expectedIP)
 		}
 	} else {
-		fmt.Println("✗ Failed to recover inner product (z not found in S)")
+		fmt.Printf("✗ Failed to recover inner product (z not found in [-%d, %d])\n", params.S, params.S)
 	}
 }
