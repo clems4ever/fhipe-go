@@ -4,11 +4,10 @@ go 1.25.1
 
 require (
 	github.com/consensys/gnark-crypto v0.19.0
-	golang.org/x/crypto v0.35.0
+	github.com/supranational/blst v0.3.16
 )
 
 require (
 	github.com/bits-and-blooms/bitset v1.20.0 // indirect
-	github.com/supranational/blst v0.3.16 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 )
